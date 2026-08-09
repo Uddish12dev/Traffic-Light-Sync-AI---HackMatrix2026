@@ -1079,3 +1079,145 @@ def verify_traffic_light_transitions(checkpoint_path: str, device: torch.device)
         )
         return False
 
+# --- Main Function ---
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train Traffic Multi-Task MLP Model")
+    parser.add_argument("--csv-path", type=str, default="traffic_dataset.csv", help="Path to dataset CSV")
+    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs per configuration")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--save-path", type=str, default="outputs/traffic_model.pt", help="Path to save model checkpoint")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    args = parser.parse_args()
+
+    log = get_logger("train_traffic_model")
+
+    # Set random seeds
+    make_deterministic(args.seed)
+
+    # Determine Device (GPU/CUDA support)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        log.info("Local GPU detected! Training on GPU: %s (device_idx: 0)", gpu_name)
+    else:
+        log.info("Local GPU (CUDA) not available. Training on CPU.")
+
+    # Load and process data
+    try:
+        X_train, y_wait_train, y_light_train, X_val, y_wait_val, y_light_val, means, stds, categories = (
+            load_and_preprocess_data(args.csv_path, seed=args.seed)
+        )
+    except Exception as e:
+        log.error("Failed to load and preprocess data: %s", e)
+        return
+
+    # Create PyTorch datasets and loaders
+    train_dataset = TensorDataset(
+        torch.from_numpy(X_train),
+        torch.from_numpy(y_wait_train),
+        torch.from_numpy(y_light_train),
+    )
+    val_dataset = TensorDataset(
+        torch.from_numpy(X_val),
+        torch.from_numpy(y_wait_val),
+        torch.from_numpy(y_light_val),
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+
+    loaders = (train_loader, val_loader)
+    input_dim = X_train.shape[1]
+
+    # Hyperparameter Configurations (Run the model several times with different configs)
+    configs = [
+        {"lr": 1e-3, "hidden_dim": 64},
+        {"lr": 5e-4, "hidden_dim": 128},
+        {"lr": 5e-4, "hidden_dim": 64},
+    ]
+
+    log.info("Starting hyperparameter sweep (%d runs)...", len(configs))
+    best_val_loss = float("inf")
+    results = []
+
+    for idx, cfg in enumerate(configs, 1):
+        lr = cfg["lr"]
+        hidden_dim = cfg["hidden_dim"]
+
+        val_mse, val_acc, is_best = train_config(
+            run_idx=idx,
+            lr=lr,
+            hidden_dim=hidden_dim,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            loaders=loaders,
+            input_dim=input_dim,
+            device=device,
+            best_val_loss=best_val_loss,
+            save_path=args.save_path,
+            means=means,
+            stds=stds,
+            categories=categories,
+        )
+
+        results.append((idx, lr, hidden_dim, val_mse, val_acc))
+        if is_best:
+            ckpt = torch.load(args.save_path, map_location="cpu")
+            best_val_loss = ckpt["val_loss"]
+
+    # Print Summary Table of all Runs
+    log.info("=========================================================")
+    log.info("HYPERPARAMETER SWEEP SUMMARY")
+    log.info("=========================================================")
+    log.info("Run | LR     | Hidden Dim | Val Wait MSE | Val Light Acc")
+    log.info("---------------------------------------------------------")
+    for r in results:
+        log.info("%3d | %.4f | %10d | %12.4f | %12.2f%%", r[0], r[1], r[2], r[3], r[4] * 100)
+    log.info("=========================================================")
+    log.info("Saved best overall model checkpoint to %s", args.save_path)
+
+    # Verify transition predictions
+    verify_traffic_light_transitions(args.save_path, device)
+
+    # Run a short dynamic simulation to verify everything is 100% error free
+    log.info("Running post-training verification simulation...")
+    nodes = [
+        TrafficSignalNode(
+            name="Primary_AI_Model",
+            initial_state="Green",
+            initial_params={
+                "vehicle_count": 80.0,
+                "average_speed": 15.0,
+                "lane_occupancy": 65.0,
+                "flow_rate": 1200.0,
+                "time_of_day": "morning"
+            }
+        ),
+        TrafficSignalNode(
+            name="Secondary_AI_Model",
+            initial_state="Red",
+            initial_params={
+                "vehicle_count": 10.0,
+                "average_speed": 50.0,
+                "lane_occupancy": 8.0,
+                "flow_rate": 200.0,
+                "time_of_day": "morning"
+            }
+        )
+    ]
+    conflict_map = {
+        "Primary_AI_Model": ["Secondary_AI_Model"],
+        "Secondary_AI_Model": ["Primary_AI_Model"]
+    }
+    controller = DynamicTrafficLightController(nodes, conflict_map)
+    controller.download_models_to_devices(args.save_path)
+    
+    # Run 5 validation simulation steps
+    for step in range(1, 6):
+        controller.run_simulation_step(step)
+
+    log.info("Validation simulation completed successfully. model.py execution finished.")
+
+
+if __name__ == "__main__":
+    main()

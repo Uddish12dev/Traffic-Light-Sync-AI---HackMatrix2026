@@ -496,3 +496,586 @@ class QueueEstimator:
             self._ema[name] = prev
         return {name: LaneStats(**vars(s)) for name, s in self._ema.items()}
 
+# ---Controller Classes---
+class CCTVCamera:
+    """Represents a CCTV camera associated with a traffic signal."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.log = get_logger(f"cctv_{name}")
+        self.model_path = None
+        self.model = None
+        self.categories = []
+        self.means = None
+        self.stds = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize perception modules
+        poly = [(0, 0), (1920, 0), (1920, 1080), (0, 1080)]
+        self.lanes = LanePolygons(polygons={name: poly}, fps=10.0, metres_per_pixel=0.05)
+        self.detector = VehicleDetector()
+        self.tracker = CentroidTracker()
+        self.estimator = QueueEstimator(lanes=self.lanes)
+
+    def download_model(self, checkpoint_path: str):
+        """Simulates downloading the model from a remote source to local CCTV storage."""
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Source model checkpoint not found at: {checkpoint_path}")
+
+        local_dir = f"outputs/cctv_downloads/cctv_{self.name}"
+        os.makedirs(local_dir, exist_ok=True)
+        local_dest = os.path.join(local_dir, "traffic_model.pt")
+
+        self.log.info(
+            "Downloading model checkpoint from %s to CCTVCamera %s local storage at %s...",
+            checkpoint_path,
+            self.name,
+            local_dest,
+        )
+        shutil.copy(checkpoint_path, local_dest)
+        self.model_path = local_dest
+
+        checkpoint = torch.load(local_dest, map_location=self.device)
+        self.categories = checkpoint["categories"]
+        self.means = np.array(checkpoint["input_means"], dtype=np.float32)
+        self.stds = np.array(checkpoint["input_stds"], dtype=np.float32)
+        hidden_dim = checkpoint.get("hidden_dim", 64)
+        input_dim = 4 + len(self.categories)
+
+        self.model = TrafficMultiTaskModel(input_dim=input_dim, hidden_dim=hidden_dim).to(self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.eval()
+        self.log.info("CCTVCamera %s successfully loaded downloaded model.", self.name)
+
+    def predict(
+        self,
+        vehicle_count: float,
+        average_speed: float,
+        lane_occupancy: float,
+        flow_rate: float,
+        time_of_day: str,
+    ) -> tuple[float, str]:
+        """Perform predictions using the local downloaded model."""
+        if self.model is None:
+            raise RuntimeError(f"No model downloaded or loaded on CCTVCamera {self.name}.")
+
+        num_features = np.array([vehicle_count, average_speed, lane_occupancy, flow_rate], dtype=np.float32)
+        num_normalized = (num_features - self.means) / self.stds
+
+        time_encoded = [0.0] * len(self.categories)
+        tod_clean = time_of_day.strip().lower()
+        if tod_clean in self.categories:
+            time_encoded[self.categories.index(tod_clean)] = 1.0
+
+        input_vec = np.concatenate([num_normalized, time_encoded]).astype(np.float32)
+        input_tensor = torch.from_numpy(input_vec).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            pred_wait, pred_light = self.model(input_tensor)
+            predicted_wait = pred_wait.item()
+            _, predicted_class = torch.max(pred_light, 1)
+            predicted_class = predicted_class.item()
+
+        color_mapping = {0: "Red", 1: "Yellow", 2: "Green"}
+        recommended_color = color_mapping.get(predicted_class, "Unknown")
+        return predicted_wait, recommended_color
+
+    def detect_vehicles(self, frame=None, simulated_count: float = 0.0) -> list[Detection]:
+        """Perform virtual detection if no frame is provided, otherwise real YOLO detection."""
+        if frame is not None:
+            try:
+                return self.detector.detect(frame)
+            except Exception as e:
+                self.log.warning("Real detection failed: %s. Falling back to virtual detection.", e)
+
+        # Virtual detection: generate random bounding boxes for simulated_count vehicles
+        detections = []
+        for _ in range(int(simulated_count)):
+            x1 = random.uniform(100.0, 1500.0)
+            y1 = random.uniform(100.0, 800.0)
+            w = random.uniform(80.0, 150.0)
+            h = random.uniform(80.0, 150.0)
+            x2 = x1 + w
+            y2 = y1 + h
+            conf = random.uniform(0.75, 0.98)
+            cls = random.choice([2, 3, 5, 7])
+            detections.append(Detection(bbox=(x1, y1, x2, y2), conf=conf, cls=cls))
+        return detections
+
+    def process_frame(self, frame=None, simulated_count: float = 0.0, frame_idx: int = 0) -> dict[str, float]:
+        """Detect, track, and estimate parameters from the frame."""
+        detections = self.detect_vehicles(frame, simulated_count)
+        tracks = self.tracker.update(detections, frame_idx)
+        stats = self.estimator.update(tracks, frame_idx)
+
+        lane_stat = stats.get(self.name)
+        vehicle_count = float(len(detections))
+
+        if lane_stat and lane_stat.mean_speed_mps > 0:
+            average_speed = float(lane_stat.mean_speed_mps * 3.6)
+        else:
+            average_speed = 30.0
+
+        lane_occupancy = float(min(100.0, vehicle_count * 1.25))
+
+        if lane_stat and lane_stat.arrival_rate_vps > 0:
+            flow_rate = float(lane_stat.arrival_rate_vps * 3600.0)
+        else:
+            flow_rate = vehicle_count * 15.0
+
+        return {
+            "vehicle_count": vehicle_count,
+            "average_speed": average_speed,
+            "lane_occupancy": lane_occupancy,
+            "flow_rate": flow_rate,
+        }
+
+
+class TrafficLightDevice:
+    """Represents a traffic light unit with local micro-controller capability."""
+
+    def __init__(self, name: str, initial_state: str = "Red"):
+        self.name = name
+        self.state = initial_state
+        self.timer = 0
+        self.log = get_logger(f"light_{name}")
+        self.model_path = None
+        self.model = None
+        self.categories = []
+        self.means = None
+        self.stds = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def download_model(self, checkpoint_path: str):
+        """Simulates downloading the model checkpoint to the local Traffic Light micro-controller."""
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Source model checkpoint not found at: {checkpoint_path}")
+
+        local_dir = f"outputs/traffic_light_downloads/light_{self.name}"
+        os.makedirs(local_dir, exist_ok=True)
+        local_dest = os.path.join(local_dir, "traffic_model.pt")
+
+        self.log.info(
+            "Downloading model checkpoint from %s to TrafficLight %s local storage at %s...",
+            checkpoint_path,
+            self.name,
+            local_dest,
+        )
+        shutil.copy(checkpoint_path, local_dest)
+        self.model_path = local_dest
+
+        checkpoint = torch.load(local_dest, map_location=self.device)
+        self.categories = checkpoint["categories"]
+        self.means = np.array(checkpoint["input_means"], dtype=np.float32)
+        self.stds = np.array(checkpoint["input_stds"], dtype=np.float32)
+        hidden_dim = checkpoint.get("hidden_dim", 64)
+        input_dim = 4 + len(self.categories)
+
+        self.model = TrafficMultiTaskModel(input_dim=input_dim, hidden_dim=hidden_dim).to(self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.eval()
+        self.log.info("TrafficLight %s successfully loaded downloaded model.", self.name)
+
+    def predict(
+        self,
+        vehicle_count: float,
+        average_speed: float,
+        lane_occupancy: float,
+        flow_rate: float,
+        time_of_day: str,
+    ) -> tuple[float, str]:
+        """Perform predictions using the local downloaded model."""
+        if self.model is None:
+            raise RuntimeError(f"No model downloaded or loaded on TrafficLightDevice {self.name}.")
+
+        num_features = np.array([vehicle_count, average_speed, lane_occupancy, flow_rate], dtype=np.float32)
+        num_normalized = (num_features - self.means) / self.stds
+
+        time_encoded = [0.0] * len(self.categories)
+        tod_clean = time_of_day.strip().lower()
+        if tod_clean in self.categories:
+            time_encoded[self.categories.index(tod_clean)] = 1.0
+
+        input_vec = np.concatenate([num_normalized, time_encoded]).astype(np.float32)
+        input_tensor = torch.from_numpy(input_vec).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            pred_wait, pred_light = self.model(input_tensor)
+            predicted_wait = pred_wait.item()
+            _, predicted_class = torch.max(pred_light, 1)
+            predicted_class = predicted_class.item()
+
+        color_mapping = {0: "Red", 1: "Yellow", 2: "Green"}
+        recommended_color = color_mapping.get(predicted_class, "Unknown")
+        return predicted_wait, recommended_color
+
+
+class TrafficSignalNode:
+    """Combines CCTVCamera, TrafficLightDevice, and traffic parameters."""
+
+    def __init__(self, name: str, initial_state: str, initial_params: dict):
+        self.name = name
+        self.cctv = CCTVCamera(name=name)
+        self.traffic_light = TrafficLightDevice(name=name, initial_state=initial_state)
+        self.params = initial_params.copy()
+        self.ai_model_role = "Standby"
+
+    def download_models(self, checkpoint_path: str):
+        """Triggers simulated downloads to both CCTV and Traffic Light devices."""
+        self.cctv.download_model(checkpoint_path)
+        self.traffic_light.download_model(checkpoint_path)
+
+    def update_params(self, vehicle_delta: float, occupancy_delta: float):
+        """Simulate changes in traffic parameters."""
+        self.params["vehicle_count"] = max(0.0, self.params["vehicle_count"] + vehicle_delta)
+        self.params["lane_occupancy"] = max(0.0, min(100.0, self.params["lane_occupancy"] + occupancy_delta))
+        self.params["flow_rate"] = self.params["vehicle_count"] * 15.0
+
+
+class DynamicTrafficLightController:
+    """Manages primary and secondary AI model nodes dynamically."""
+
+    def __init__(self, nodes: list[TrafficSignalNode], conflict_map: dict[str, list[str]] = None):
+        self.log = get_logger("dynamic_controller")
+        self.nodes = nodes
+        self.conflict_map = conflict_map or {}
+        self.primary_node: TrafficSignalNode | None = None
+        self.secondary_node: TrafficSignalNode | None = None
+
+        # Initialize dataset file path
+        self.dataset_path = "data/detected_traffic_parameters.csv"
+        os.makedirs(os.path.dirname(self.dataset_path), exist_ok=True)
+        with open(self.dataset_path, "w", encoding="utf-8") as f:
+            f.write("step,node_name,vehicle_count,average_speed,lane_occupancy,flow_rate,time_of_day\n")
+
+        # Set initial parameters for nodes using CCTV camera detection (step 0)
+        self.log.info("Initializing node parameters using CCTV camera detection...")
+        for node in self.nodes:
+            detected_params = node.cctv.process_frame(
+                frame=None,
+                simulated_count=node.params["vehicle_count"],
+                frame_idx=0
+            )
+            node.params.update(detected_params)
+            self.log.info(
+                "Initial detected parameters for %s: VC=%.1f, Occ=%.1f%%, Flow=%.1f",
+                node.name,
+                node.params["vehicle_count"],
+                node.params["lane_occupancy"],
+                node.params["flow_rate"]
+            )
+            self.save_to_dataset(0, node)
+
+        # Build connectivity log to nearby signals
+        for node in self.nodes:
+            nearby_nodes = [n.name for n in self.nodes if n.name != node.name]
+            self.log.info("Signal node %s connected to nearby signals: %s", node.name, nearby_nodes)
+
+        # Set initial roles based on initial green light parameter
+        self.update_roles(initial=True)
+
+    def save_to_dataset(self, step: int, node: TrafficSignalNode):
+        """Append the current detected parameters of a node to the dataset CSV."""
+        import csv
+        with open(self.dataset_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                step,
+                node.name,
+                node.params["vehicle_count"],
+                node.params["average_speed"],
+                node.params["lane_occupancy"],
+                node.params["flow_rate"],
+                node.params["time_of_day"]
+            ])
+
+    def download_models_to_devices(self, checkpoint_path: str):
+        """Simulates downloading the AI model to all managed devices (CCTV and traffic lights)."""
+        self.log.info("Initiating model downloads to all CCTV cameras and Traffic Lights...")
+        for node in self.nodes:
+            node.download_models(checkpoint_path)
+        self.log.info("All devices successfully downloaded and initialized the AI model.")
+
+    def update_roles(self, initial: bool = False):
+        """Update Primary/Secondary AI model assignments.
+
+        - Traffic light containing Green is Primary.
+        - Next traffic light in configuration sequence is Secondary.
+        """
+        old_primary = self.primary_node
+        old_secondary = self.secondary_node
+
+        new_primary = None
+        new_primary_idx = -1
+
+        for i, node in enumerate(self.nodes):
+            if node.traffic_light.state in ("Green", "Yellow_to_Red"):
+                new_primary = node
+                new_primary_idx = i
+                break
+
+        if new_primary is None:
+            for i, node in enumerate(self.nodes):
+                if node.traffic_light.state == "Green":
+                    new_primary = node
+                    new_primary_idx = i
+                    break
+
+        if new_primary is None and len(self.nodes) > 0:
+            new_primary = self.nodes[0]
+            new_primary_idx = 0
+
+        new_secondary = None
+        if new_primary_idx != -1 and len(self.nodes) > 1:
+            sec_idx = (new_primary_idx + 1) % len(self.nodes)
+            new_secondary = self.nodes[sec_idx]
+
+        self.primary_node = new_primary
+        self.secondary_node = new_secondary
+
+        # Assign roles to signals
+        for node in self.nodes:
+            if node == self.primary_node:
+                node.ai_model_role = "Primary"
+            elif node == self.secondary_node:
+                node.ai_model_role = "Secondary"
+            else:
+                node.ai_model_role = "Standby"
+
+        # Log role updates
+        if initial:
+            self.log.info(
+                "[Role Init] Primary AI Model: %s (Green light node) | Secondary AI Model: %s (Next in configuration)",
+                self.primary_node.name if self.primary_node else "None",
+                self.secondary_node.name if self.secondary_node else "None",
+            )
+        elif old_primary != self.primary_node or old_secondary != self.secondary_node:
+            self.log.info(
+                "[Role Switch] Green light shifted! Primary AI Model: %s | Secondary AI Model: %s",
+                self.primary_node.name if self.primary_node else "None",
+                self.secondary_node.name if self.secondary_node else "None",
+            )
+
+    def run_simulation_step(self, step_idx: int):
+        """Simulate a single controller time step."""
+        self.log.info("=== Sim Step %d ===", step_idx)
+
+        # 1. Update/Simulate traffic parameters based on state
+        for node in self.nodes:
+            if node.traffic_light.state == "Green":
+                node.update_params(vehicle_delta=-12.0, occupancy_delta=-10.0)
+            elif node.traffic_light.state == "Red":
+                node.update_params(vehicle_delta=15.0, occupancy_delta=10.0)
+
+        # 2. Run CCTV camera vehicle detection on each node to update parameters and log to dataset CSV
+        for node in self.nodes:
+            detected_params = node.cctv.process_frame(
+                frame=None,
+                simulated_count=node.params["vehicle_count"],
+                frame_idx=step_idx
+            )
+            node.params.update(detected_params)
+            self.save_to_dataset(step_idx, node)
+
+        # Log current status
+        for node in self.nodes:
+            self.log.info(
+                "Signal %s (Light=%s, ModelRole=%s): VC=%.1f, Occ=%.1f%%",
+                node.name,
+                node.traffic_light.state,
+                node.ai_model_role,
+                node.params["vehicle_count"],
+                node.params["lane_occupancy"],
+            )
+
+        # 3. Run state transitions
+        next_states = {}
+
+        for node in self.nodes:
+            current_state = node.traffic_light.state
+            name = node.name
+
+            if current_state == "Green":
+                if node.ai_model_role == "Primary":
+                    pred_wait, pred_color = node.traffic_light.predict(
+                        vehicle_count=node.params["vehicle_count"],
+                        average_speed=node.params["average_speed"],
+                        lane_occupancy=node.params["lane_occupancy"],
+                        flow_rate=node.params["flow_rate"],
+                        time_of_day=node.params["time_of_day"],
+                    )
+                    self.log.info(
+                        "Signal %s (GREEN, Primary Model) -> AI recommendation: %s (Wait prediction: %.2fs)",
+                        name,
+                        pred_color,
+                        pred_wait,
+                    )
+
+                    if pred_color in ("Yellow", "Red"):
+                        self.log.info(
+                            "Signal %s Primary AI model detected clear lane. Initiating transition to RED/YELLOW.",
+                            name,
+                        )
+                        next_states[name] = ("Yellow_to_Red", 2)
+                    else:
+                        next_states[name] = ("Green", 0)
+                else:
+                    self.log.info(
+                        "Signal %s (GREEN) -> Role is %s (Not Primary). Transition forbidden. Staying GREEN.",
+                        name,
+                        node.ai_model_role,
+                    )
+                    next_states[name] = ("Green", 0)
+
+            elif current_state == "Yellow_to_Red":
+                if node.traffic_light.timer > 0:
+                    self.log.info(
+                        "Signal %s (Yellow_to_Red) transitioning. Steps remaining: %d",
+                        name,
+                        node.traffic_light.timer,
+                    )
+                    next_states[name] = ("Yellow_to_Red", node.traffic_light.timer - 1)
+                else:
+                    self.log.info("Signal %s transition complete. Now RED.", name)
+                    next_states[name] = ("Red", 0)
+
+            elif current_state == "Red":
+                if node.ai_model_role == "Secondary":
+                    pred_wait, pred_color = node.traffic_light.predict(
+                        vehicle_count=node.params["vehicle_count"],
+                        average_speed=node.params["average_speed"],
+                        lane_occupancy=node.params["lane_occupancy"],
+                        flow_rate=node.params["flow_rate"],
+                        time_of_day=node.params["time_of_day"],
+                    )
+
+                    role_label = f"RED, Secondary Model"
+                    self.log.info(
+                        "Signal %s (%s) -> AI recommendation: %s (Wait prediction: %.2fs)",
+                        name,
+                        role_label,
+                        pred_color,
+                        pred_wait,
+                    )
+
+                    if pred_color == "Green":
+                        self.log.info(
+                            "Signal %s (RED, Secondary Model) -> AI Model requests GREEN. Checking connected radar...",
+                            name,
+                        )
+
+                        conflicts = self.conflict_map.get(name, [])
+                        has_conflict = False
+                        for conf_name in conflicts:
+                            conf_node = next((n for n in self.nodes if n.name == conf_name), None)
+                            if conf_node and conf_node.traffic_light.state != "Red":
+                                self.log.warning(
+                                    "SAFETY INTERLOCK ACTIVE: %s wants to change to Green, "
+                                    "but conflicting signal %s is currently %s! Staying RED.",
+                                    name,
+                                    conf_node.name,
+                                    conf_node.traffic_light.state,
+                                )
+                                has_conflict = True
+                                break
+
+                        if not has_conflict:
+                            self.log.info("Safety Check Passed! Initiating transition to GREEN.")
+                            next_states[name] = ("Yellow_to_Green", 2)
+                        else:
+                            next_states[name] = ("Red", 0)
+                    else:
+                        next_states[name] = ("Red", 0)
+                else:
+                    self.log.info(
+                        "Signal %s (RED) -> Role is %s (Not Secondary). Transition forbidden. Staying RED.",
+                        name,
+                        node.ai_model_role,
+                    )
+                    next_states[name] = ("Red", 0)
+
+            elif current_state == "Yellow_to_Green":
+                if node.traffic_light.timer > 0:
+                    self.log.info(
+                        "Signal %s (Yellow_to_Green) transitioning. Steps remaining: %d",
+                        name,
+                        node.traffic_light.timer,
+                    )
+                    next_states[name] = ("Yellow_to_Green", node.traffic_light.timer - 1)
+                else:
+                    self.log.info("Signal %s transition complete. Now GREEN.", name)
+                    next_states[name] = ("Green", 0)
+
+        for name, (state, timer) in next_states.items():
+            node = next((n for n in self.nodes if n.name == name), None)
+            if node:
+                node.traffic_light.state = state
+                node.traffic_light.timer = timer
+
+        self.update_roles()
+
+# ---Transition Verification Logic ---
+def verify_traffic_light_transitions(checkpoint_path: str, device: torch.device) -> bool:
+    """Verify that the saved model correctly transitions: Green -> Yellow -> Red."""
+    log = get_logger("transition_verifier")
+    log.info("Verifying traffic light transitions for model: %s", checkpoint_path)
+
+    if not os.path.exists(checkpoint_path):
+        log.error("Checkpoint not found for verification: %s", checkpoint_path)
+        return False
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    categories = checkpoint["categories"]
+    means = np.array(checkpoint["input_means"], dtype=np.float32)
+    stds = np.array(checkpoint["input_stds"], dtype=np.float32)
+    hidden_dim = checkpoint.get("hidden_dim", 64)
+
+    input_dim = 4 + len(categories)
+    model = TrafficMultiTaskModel(input_dim=input_dim, hidden_dim=hidden_dim).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    color_mapping = {0: "Red", 1: "Yellow", 2: "Green"}
+
+    steps = [
+        (85.0, 15.0, 65.0, 1200.0, "morning", "Green"),
+        (50.0, 30.0, 40.0, 800.0, "morning", "Yellow"),
+        (20.0, 50.0, 15.0, 300.0, "morning", "Red"),
+    ]
+
+    actual_transitions = []
+
+    for idx, (vc, speed, occ, flow, tod, expected) in enumerate(steps, 1):
+        num_features = np.array([vc, speed, occ, flow], dtype=np.float32)
+        num_normalized = (num_features - means) / stds
+
+        time_encoded = [0.0] * len(categories)
+        tod_clean = tod.strip().lower()
+        if tod_clean in categories:
+            time_encoded[categories.index(tod_clean)] = 1.0
+
+        input_vec = np.concatenate([num_normalized, time_encoded]).astype(np.float32)
+        input_tensor = torch.from_numpy(input_vec).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            pred_wait, pred_light = model(input_tensor)
+            _, predicted_class = torch.max(pred_light, 1)
+            predicted_class = predicted_class.item()
+
+        predicted_color = color_mapping.get(predicted_class, "Unknown")
+        actual_transitions.append(predicted_color)
+        log.info(
+            "Step %d: VC=%.1f, Occ=%.1f%% -> Expected: %s, Predicted: %s (Wait prediction: %.2f)",
+            idx, vc, occ, expected, predicted_color, pred_wait.item()
+        )
+
+    if actual_transitions == ["Green", "Yellow", "Red"]:
+        log.info("SUCCESS: Model correctly transitions: Green -> Yellow -> Red")
+        return True
+    else:
+        log.warning(
+            "FAILED: Model did not transition in Green -> Yellow -> Red sequence. Actual sequence: %s",
+            actual_transitions,
+        )
+        return False
+
